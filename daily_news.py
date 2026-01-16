@@ -1,10 +1,15 @@
 import os
+import feedparser
 import requests
-import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from openai import OpenAI
 
-# ================= 🌟 终极情报源配置 =================
+# ================= ⚡️ 你的“即时雷达”配置 =================
+# 1. 扫描频率配合：这里设定只看“过去 2 小时”的新闻
+# (设为 2 小时是为了防止 GitHub 运行排队导致的漏抓，稍微宽裕一点)
+LOOKBACK_HOURS = 2 
+
+# 2. 情报源 (保持你的中西合璧配置)
 rss_list = [
     # --- 🇨🇳 国内主力 ---
     "https://www.jiqizhixin.com/rss",          # 机器之心
@@ -13,112 +18,94 @@ rss_list = [
     "https://feed.feeddd.org/feeds/Rockhazix", # 数字生命卡兹克
 
     # --- 🌍 海外前沿 ---
-    "https://www.reddit.com/r/LocalLLaMA/top/.rss?t=day", # Reddit LocalLLaMA
+    "https://www.reddit.com/r/LocalLLaMA/top/.rss?t=day", # Reddit
     "https://hnrss.org/newest?points=100",                # Hacker News
-    "https://openai.com/blog/rss.xml",                    # OpenAI Blog
+    "https://openai.com/blog/rss.xml",                    # OpenAI 
 ]
 
-# 🔑 密钥配置 (适配 ServerChan)
+# 🔑 密钥配置
 api_key = os.getenv("OPENAI_API_KEY")
 api_base = os.getenv("OPENAI_API_BASE")
-server_chan_key = os.getenv("SERVER_CHAN_KEY") # 读取 ServerChan Key
+server_chan_key = os.getenv("SERVER_CHAN_KEY")
 client = OpenAI(api_key=api_key, base_url=api_base)
 # =======================================================
 
-def get_rss_content(url):
-    """抓取 RSS 内容 (带浏览器伪装)"""
+def is_recent(entry):
+    """判断文章是否是最近发布的"""
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
-        response = requests.get(url, headers=headers, timeout=15)
-        if response.status_code != 200:
-            return []
-            
-        content = response.text
-        try:
-            root = ET.fromstring(content)
-        except:
-            root = ET.fromstring(content.encode('utf-8'))
-
-        items = []
-        ns = {'atom': 'http://www.w3.org/2005/Atom'} 
-        has_ns = 'http://www.w3.org/2005/Atom' in content
-        entries = root.findall('.//item') + root.findall('.//atom:entry', ns if has_ns else {})
+        # feedparser 会自动把各种格式的时间转成 struct_time
+        published = entry.get('published_parsed') or entry.get('updated_parsed')
+        if not published:
+            return False # 没有时间的文章直接跳过，防止乱发
         
-        for item in entries[:6]: 
-            title_node = item.find('title') if item.find('title') is not None else item.find('atom:title', ns if has_ns else {})
-            title = title_node.text if title_node is not None else "无标题"
-            
-            link = ""
-            if item.find('link') is not None:
-                link = item.find('link').text
-            elif has_ns and item.find('atom:link', ns) is not None:
-                link = item.find('atom:link', ns).attrib.get('href')
-            
-            desc = ""
-            if item.find('description') is not None:
-                desc = item.find('description').text
-            elif has_ns and item.find('atom:summary', ns) is not None:
-                desc = item.find('atom:summary', ns).text
-            
-            if desc:
-                desc = desc.replace('<p>', '').replace('</p>', '')[:200]
+        # 转换成 UTC 时间对象
+        pub_time = datetime(*published[:6], tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        
+        # 检查时间差
+        if (now - pub_time) <= timedelta(hours=LOOKBACK_HOURS):
+            return True
+        return False
+    except:
+        return False
 
-            items.append(f"【来源】{url}\n【标题】{title}\n【简介】{desc}\n【链接】{link}\n")
-        return items
-    except Exception as e:
-        print(f"⚠️ 抓取出错 {url}: {e}")
-        return []
+def get_latest_news():
+    """只抓取最近更新的新闻"""
+    recent_items = []
+    
+    print(f"📡 正在扫描过去 {LOOKBACK_HOURS} 小时的更新...")
+    
+    for url in rss_list:
+        try:
+            # 使用 feedparser 解析，因为它对时间处理最强
+            feed = feedparser.parse(url)
+            
+            for entry in feed.entries[:5]: # 每个源只看最新的5条，再筛时间
+                if is_recent(entry):
+                    title = entry.title
+                    link = entry.link
+                    # 简介截取
+                    desc = entry.summary if 'summary' in entry else entry.title
+                    desc = desc[:150].replace('<p>','').replace('</p>','')
+                    
+                    recent_items.append(f"【来源】{feed.feed.title}\n【标题】{title}\n【链接】{link}\n【简介】{desc}\n")
+        except Exception as e:
+            print(f"⚠️ 抓取跳过 {url}: {e}")
+            continue
+            
+    return recent_items
 
 def send_to_wechat(title, content):
-    """🚀 推送消息到微信 (ServerChan 版)"""
-    if not server_chan_key:
-        print("❌ 未配置 SERVER_CHAN_KEY，跳过推送")
-        return
-
-    # ServerChan 的 API 地址
+    if not server_chan_key: return
     url = f"https://sctapi.ftqq.com/{server_chan_key}.send"
-    
-    data = {
-        "title": title,
-        "desp": content # ServerChan 把正文叫做 'desp'
-    }
-    
-    try:
-        resp = requests.post(url, data=data)
-        result = resp.json()
-        if result.get('code') == 0:
-            print("✅ 微信推送成功！(ServerChan)")
-        else:
-            print(f"❌ 微信推送失败: {result}")
-    except Exception as e:
-        print(f"❌ 推送网络错误: {e}")
+    data = {"title": title, "desp": content}
+    requests.post(url, data=data)
+    print("✅ 消息已推送")
 
 def main():
-    print("🚀 开始抓取 (ServerChan版)...")
-    all_news = []
-    for url in rss_list:
-        all_news.extend(get_rss_content(url))
+    # 1. 抓取
+    news = get_latest_news()
     
-    if not all_news:
-        print("📭 无内容")
+    # 2. 如果没有新东西，直接下班
+    if not news:
+        print("😴 过去一小时风平浪静，没有新消息。")
         return
 
-    content_text = "\n\n".join(all_news)
-    print("🤖 AI 正在撰写日报...")
+    print(f"🚀 发现 {len(news)} 条新情报！正在分析...")
+    content_text = "\n\n".join(news)
 
+    # 3. AI 分析 (Prompt 换成了“快讯”风格)
     prompt = f"""
-    你是 AI 科技情报官。请根据以下素材写一份【今日 AI 必读】日报。
+    这里有几条刚刚发生的 AI 科技新闻。请快速生成一份**【即时快讯】**。
     
     要求：
-    1. 挑选 6-8 条最重要的中外 AI 新闻。
-    2. 标题要像公众号爆款，带 Emoji。
-    3. 内容说人话，解释技术背后的意义。
-    4. 必须包含 [🌍全球] 和 [🇨🇳国内] 两个板块。
-    5. 每条新闻后附上 [🔗原文链接]。
-    6. 结尾加一句简短的“小编热评”。
-
+    1. 不要写成日报，要写成**“突发消息”**的感觉。
+    2. 只保留有价值的内容，如果是无聊的广告直接忽略。
+    3. 格式：
+       🔥 **标题**
+       内容：一句话讲清楚发生了什么。
+       [🔗原文]
+    
     素材：
     {content_text}
     """
@@ -126,18 +113,18 @@ def main():
     response = client.chat.completions.create(
         model="deepseek-chat",
         messages=[{"role": "user", "content": prompt}],
-        temperature=1.0
+        temperature=0.7
     )
     
-    daily_report = response.choices[0].message.content
-    
+    result = response.choices[0].message.content
     print("="*30)
-    print(daily_report)
+    print(result)
     print("="*30)
     
-    # 🔥 发送！
-    today_date = datetime.now().strftime("%Y-%m-%d")
-    send_to_wechat(f"🤖 AI日報 {today_date}", daily_report)
+    # 4. 推送
+    # 标题带上具体时间，比如 "AI快讯 14:00"
+    current_time = datetime.now().strftime("%H:%M")
+    send_to_wechat(f"🚨 AI快讯 {current_time}", result)
 
 if __name__ == "__main__":
     main()
