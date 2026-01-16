@@ -1,125 +1,143 @@
 import os
-import feedparser
 import requests
-import time
-from datetime import datetime, timedelta, timezone
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta
 from openai import OpenAI
-from dotenv import load_dotenv
 
-# ================= 配置区 =================
-SERVER_CHAN_KEY = os.getenv("SERVER_CHAN_KEY") 
-# ⏱️ 抓取时间窗口：只看过去 2 小时内发布的新闻
-LOOKBACK_HOURS = 2 
-# =========================================
+# ================= 🌟 终极情报源配置 =================
+rss_list = [
+    # --- 🇨🇳 国内主力 (你的最爱) ---
+    # 选用官网源（内容和公众号一致，但极度稳定，不会报错）
+    "https://www.jiqizhixin.com/rss",          # 机器之心
+    "https://www.qbitai.com/feed",             # 量子位
+    "https://www.geekpark.net/rss",            # 极客公园
+    "https://feed.feeddd.org/feeds/Rockhazix", # 数字生命卡兹克 (个人号，很稳)
 
-load_dotenv(override=True)
+    # --- 🌍 海外前沿 (补充视野) ---
+    # 既然你要做最酷的助手，必须要有硅谷的一手消息
+    "https://www.reddit.com/r/LocalLLaMA/top/.rss?t=day", # Reddit (开源大模型大本营)
+    "https://hnrss.org/newest?points=100",                # Hacker News (全球技术热点)
+    "https://openai.com/blog/rss.xml",                    # OpenAI 官方博客
+]
+
+# AI 设置
 api_key = os.getenv("OPENAI_API_KEY")
 api_base = os.getenv("OPENAI_API_BASE")
 client = OpenAI(api_key=api_key, base_url=api_base)
+# =======================================================
 
-# ✅ 你的 RSS 列表
-rss_list = [
-    "https://feed.feeddd.org/feeds/Rockhazix",  # 数字生命卡兹克
-    "https://www.huxiu.com/rss/0.xml",          # 虎嗅
-    "https://www.jiqizhixin.com/rss",           # 机器之心
-    "http://www.geekpark.net/rss",              # 极客公园
-    "https://www.ifanr.com/feed",               # APPSO/爱范儿
-    "https://www.qbitai.com/feed",              # 量子位
-    "http://www.aiera.com.cn/feed"              # 新智元
-]
-
-def push_to_wechat(title, content):
-    if not SERVER_CHAN_KEY:
-        print("❌ 未检测到 ServerChan Key，无法推送")
-        return
-    url = f"https://sctapi.ftqq.com/{SERVER_CHAN_KEY}.send"
-    data = {"title": title, "desp": content}
-    try:
-        requests.post(url, data=data)
-        print("✅ 微信推送成功！")
-    except Exception as e:
-        print(f"❌ 推送失败: {e}")
-
-def is_recent_post(entry):
-    """判断文章是否是【最近 LOOKBACK_HOURS 小时】内发布的"""
-    try:
-        published_struct = entry.get("published_parsed") or entry.get("updated_parsed")
-        if not published_struct: return True # 无时间则默认放行
-        pub_time = datetime(*published_struct[:6], tzinfo=timezone.utc)
-        now = datetime.now(timezone.utc)
-        diff = now - pub_time
-        return diff <= timedelta(hours=LOOKBACK_HOURS)
-    except Exception as e:
-        return True
-
-def check_and_summarize(source_name, title, content):
-    print(f"🤖 正在分析【{source_name}】：{title} ...")
-    if "卡兹克" in source_name or "Rockhazix" in source_name:
-        style = "用极客、幽默、搞钱的语气"
-        role_prompt = "你是卡兹克的粉丝，重点关注AI新玩法。"
-    else:
-        style = "用专业分析师的语气"
-        role_prompt = "你是一个严格的 AI 内容过滤器。"
-
-    prompt = f"""
-    {role_prompt}
-    请执行两个步骤：
-    1. **判断**：这篇文章是否与“人工智能、AI、大模型、LLM、AIGC、机器人”高度相关？
-       - 如果无关，直接回复：SKIP
-    2. **总结**：如果是 AI 相关的，{style}，总结3个核心干货点。
-
-    文章标题：{title}
-    文章内容：{content[:1000]}
+def get_rss_content(url):
+    """
+    全能抓取函数：
+    1. 伪装成 Mac 电脑上的 Chrome 浏览器（防拦截）。
+    2. 兼容 RSS 和 Atom 两种格式（防报错）。
     """
     try:
-        response = client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7
-        )
-        result = response.choices[0].message.content.strip()
-        if "SKIP" in result:
-            print(f"   🗑️  不是 AI 内容，跳过。")
-            return None
-        return result
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        # 设置超时，Reddit 有时候慢
+        response = requests.get(url, headers=headers, timeout=15)
+        
+        if response.status_code != 200:
+            print(f"❌ 抓取失败 {url}: {response.status_code}")
+            return []
+            
+        content = response.text
+        # 容错解析
+        try:
+            root = ET.fromstring(content)
+        except:
+            root = ET.fromstring(content.encode('utf-8'))
+
+        items = []
+        # 命名空间处理 (用于解析国外 Atom 格式)
+        ns = {'atom': 'http://www.w3.org/2005/Atom'} 
+        has_ns = 'http://www.w3.org/2005/Atom' in content
+        
+        # 混合查找所有文章
+        entries = root.findall('.//item') + root.findall('.//atom:entry', ns if has_ns else {})
+        
+        # 每个源只取前 6 条，避免内容太多消化不了
+        for item in entries[:6]: 
+            # 标题
+            title_node = item.find('title') if item.find('title') is not None else item.find('atom:title', ns if has_ns else {})
+            title = title_node.text if title_node is not None else "无标题"
+            
+            # 链接
+            link = ""
+            if item.find('link') is not None:
+                link = item.find('link').text
+            elif has_ns and item.find('atom:link', ns) is not None:
+                link = item.find('atom:link', ns).attrib.get('href')
+            
+            # 简介 (用来帮 AI 筛选)
+            desc = ""
+            if item.find('description') is not None:
+                desc = item.find('description').text
+            elif has_ns and item.find('atom:summary', ns) is not None:
+                desc = item.find('atom:summary', ns).text
+                
+            # 简单清洗 HTML 标签
+            if desc:
+                desc = desc.replace('<p>', '').replace('</p>', '')[:200]
+
+            items.append(f"【来源】{url}\n【标题】{title}\n【简介】{desc}\n【链接】{link}\n")
+            
+        print(f"✅ 成功抓取 {url}，获取 {len(items)} 条")
+        return items
     except Exception as e:
-        print(f"❌ API 报错: {e}")
-        return None
+        print(f"⚠️ 抓取出错 {url}: {e}") # 出错不中断，继续抓下一个
+        return []
 
 def main():
-    print(f"🌍 开始巡逻... 只寻找过去 {LOOKBACK_HOURS} 小时内的新闻")
-    daily_report = ""
-    count = 0
+    print("🚀 开始全网扫描 (国内+国外)...")
+    all_news = []
     
     for url in rss_list:
-        try:
-            feed = feedparser.parse(url)
-            if not feed.entries: continue
-            
-            if "Rockhazix" in url or "feeddd" in url: source_name = "数字生命卡兹克"
-            else: source_name = feed.feed.title if 'title' in feed.feed else "科技新闻"
+        news_items = get_rss_content(url)
+        all_news.extend(news_items)
+    
+    if not all_news:
+        print("📭 居然一条新闻都没抓到，请检查网络或源地址")
+        return
 
-            for post in feed.entries[:3]:
-                if not is_recent_post(post): continue # 太旧跳过
-                
-                title = post.title
-                link = post.link
-                content = post.summary if 'summary' in post else post.title
-                summary = check_and_summarize(source_name, title, content)
-                
-                if summary:
-                    daily_report += f"#### 【{source_name}】{title}\n{summary}\n[👉 原文]({link})\n\n---\n\n"
-                    count += 1
-        except Exception as e:
-            print(f"⚠️ 抓取 {url} 出错跳过")
-            continue
+    content_text = "\n\n".join(all_news)
+    
+    print("🤖 AI 正在阅读中英双语材料并撰写周报...")
 
-    if count > 0:
-        print(f"🚀 发现 {count} 条最新 AI 资讯，正在推送...")
-        current_hour = datetime.now().hour
-        push_to_wechat(f"AI快讯 ({current_hour}点档)", daily_report)
-    else:
-        print("😴 过去几小时内没有新的 AI 内容。")
+    # 🔥 核心 Prompt：中西合璧版
+    prompt = f"""
+    你现在是全网最懂 AI 的“科技情报官”。你的桌子上堆满了来自【机器之心】、【Reddit】、【OpenAI】的最新情报。
+    
+    请把这些中英文混杂的内容，整理成一份**“今日 AI 必读”**。
+
+    ### 你的任务：
+    1.  **筛选**：挑出 **6-8 条** 真正重要的新闻。
+        -   如果有**国内**的大模型/大厂动态，必须保留。
+        -   如果有**国外**的开源/技术突破 (来自 Reddit/HN)，必须保留并**翻译成中文**。
+    2.  **风格**：
+        -   标题要像“公众号爆款文”，带 Emoji，吸引人点击。
+        -   内容要“说人话”，不要枯燥的翻译腔。如果国外新闻比较硬核，请用通俗的语言解释一下“这有什么用”。
+    3.  **格式**：
+        -   **[🌍 全球视野]** (放国外重磅)
+        -   **[🇨🇳 国内动态]** (放机器之心/量子位的内容)
+        -   **[🛠️ 开发者/工具]** (新出的好玩工具)
+        -   每条新闻最后都要附上 [🔗原文链接]。
+
+    ### 输入素材：
+    {content_text}
+    """
+
+    response = client.chat.completions.create(
+        model="deepseek-chat",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=1.0 # 保持高创造性
+    )
+    
+    print("="*30)
+    print(response.choices[0].message.content)
+    print("="*30)
 
 if __name__ == "__main__":
     main()
