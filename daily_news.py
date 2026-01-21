@@ -14,7 +14,7 @@ HISTORY_FILE = "history.json"
 # ================= ⚡️ 你的“即时雷达”配置 =================
 # 1. 扫描频率配合：这里设定只看“过去 2 小时”的新闻
 # (设为 2 小时是为了防止 GitHub 运行排队导致的漏抓，稍微宽裕一点)
-LOOKBACK_HOURS = 24 
+LOOKBACK_HOURS = 1.2 
 
 # 2. 情报源 (保持你的中西合璧配置)
 rss_list = [
@@ -209,5 +209,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
