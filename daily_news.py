@@ -123,8 +123,11 @@ def main():
     
     # 4. 推送
     # 标题带上具体时间，比如 "AI快讯 14:00"
-    current_time = datetime.now().strftime("%H:%M")
+    # 强制加上 8 小时时差，修正为北京时间
+    bj_time = datetime.now(timezone(timedelta(hours=8)))
+    current_time = bj_time.strftime("%H:%M")
     send_to_wechat(f"🚨 AI快讯 {current_time}", result)
 
 if __name__ == "__main__":
     main()
+
